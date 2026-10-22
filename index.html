@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="vi"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Quiz tiếng Nhật</title>
+<link rel="stylesheet" href="style.css"></head>
+<body><main id="app"></main>
+<script type="module">
+import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
+import { SUPABASE_URL, SUPABASE_ANON_KEY } from './config.js';
+const sb = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+const $ = id => document.getElementById(id), app = $('app');
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+let game = null, me = null, chosen = null, lastQ = -1, startedAt = 0, msgText = '';
+let answers = [], players = [];
+
+setInterval(() => {
+  const t = $('t'); if (!t || !game) return;
+  t.textContent = Math.max(0, Math.ceil(game.time_limit - (Date.now() - startedAt) / 1000)) + ' giây';
+}, 250);
+
+async function join() {
+  const code = $('code').value.trim(), name = $('name').value.trim();
+  if (!code || !name) return say('Nhập mã phòng và tên của bạn.');
+  const { data: g } = await sb.from('games').select('*').eq('code', code).maybeSingle();
+  if (!g) return say('Không tìm thấy phòng. Kiểm tra lại mã.');
+  if (g.status !== 'lobby') return say('Game đã bắt đầu, không vào thêm được.');
+  const { data: p, error } = await sb.from('players').insert({ game_id: g.id, name }).select().single();
+  if (error) return say(error.code === '23505' ? 'Tên này đã có người dùng. Chọn tên khác.' : error.message);
+  game = g; me = p;
+  sb.channel('p-' + g.id)
+    .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'games', filter: `id=eq.${g.id}` },
+      pl => { game = { ...game, ...pl.new }; onGame(); })
+    .subscribe(async s => {
+      if (s === 'SUBSCRIBED') { const { data } = await sb.from('games').select('*').eq('id', g.id).single(); if (data) { game = data; onGame(); } }
+    });
+  render();
+}
+function say(m) { msgText = m; render(); }
+
+async function onGame() {
+  if (game.status === 'leaderboard' || game.status === 'finished') {
+    const [a, p] = await Promise.all([
+      sb.from('answers').select('*').eq('game_id', game.id),
+      sb.from('players').select('*').eq('game_id', game.id)]);
+    answers = a.data || []; players = p.data || [];
+  }
+  render();
+}
+
+async function pick(i) {
+  if (chosen !== null) return;
+  const q = game.questions[game.current_q], limit = game.time_limit * 1000, el = Date.now() - startedAt;
+  if (el > limit) return;
+  chosen = i;
+  const points = i === q.answer ? Math.round(500 + 500 * Math.max(0, 1 - el / limit)) : 0;
+  render();
+  await sb.from('answers').insert({ game_id: game.id, player_id: me.id, q_index: game.current_q, choice: i, points });
+}
+window.pick = pick; window.join = join;
+
+function ranking() {
+  const m = {}; players.forEach(p => m[p.id] = 0);
+  answers.forEach(a => { if (a.player_id in m) m[a.player_id] += a.points; });
+  return players.map(p => ({ ...p, score: m[p.id] })).sort((a, b) => b.score - a.score);
+}
+
+function render() {
+  if (!game) {
+    app.innerHTML = `<h1>Quiz tiếng Nhật</h1><input id="code" inputmode="numeric" placeholder="Mã phòng" aria-label="Mã phòng"><input id="name" maxlength="20" placeholder="Tên của bạn" aria-label="Tên của bạn"><button class="btn" onclick="join()">Vào phòng</button><p class="no">${esc(msgText)}</p>`;
+    return;
+  }
+  const g = game;
+  if (g.status === 'lobby') {
+    app.innerHTML = `<div class="c"><h1>Đã vào phòng, ${esc(me.name)}</h1><p class="muted">Chờ giáo viên bấm bắt đầu.</p></div>`;
+  } else if (g.status === 'question') {
+    if (lastQ !== g.current_q) { lastQ = g.current_q; chosen = null; startedAt = Date.now(); }
+    const q = g.questions[g.current_q];
+    app.innerHTML = `<div class="bar"><span>Câu ${g.current_q + 1}/${g.questions.length}</span><span id="t"></span></div>
+      <div class="jp">${esc(q.q)}</div><p class="muted c">${esc(q.hint || '')}</p>
+      <div class="grid">${q.options.map((o, i) => `<button class="opt ${chosen === i ? 'sel' : ''}" ${chosen !== null ? 'disabled' : ''} onclick="pick(${i})">${esc(o)}</button>`).join('')}</div>
+      <p class="c muted">${chosen !== null ? 'Đã gửi đáp án. Chờ cả lớp.' : ''}</p>`;
+  } else {
+    const r = ranking(), rank = r.findIndex(p => p.id === me.id) + 1, mine = r[rank - 1];
+    const a = answers.find(x => x.player_id === me.id && x.q_index === g.current_q);
+    const res = g.status === 'finished' ? '<h2>Kết thúc!</h2>'
+      : !a ? '<h2 class="no">Bạn chưa trả lời</h2>'
+      : a.points > 0 ? `<h2 class="ok">Đúng! +${a.points} điểm</h2>` : '<h2 class="no">Chưa đúng</h2>';
+    app.innerHTML = `${res}<p>Hạng của bạn: <b>${rank}/${r.length}</b> · ${mine ? mine.score : 0} điểm</p>
+      ${r.slice(0, 5).map((p, i) => `<div class="row ${p.id === me.id ? 'me' : ''}"><span>${i + 1}. ${esc(p.name)}</span><b>${p.score}</b></div>`).join('')}`;
+  }
+}
+render();
+</script></body></html>
